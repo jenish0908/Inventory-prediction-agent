@@ -408,7 +408,3 @@ curl -X POST http://localhost:8000/evaluations/<prediction_id>/feedback \
 Monitor over time via `GET /evaluations/summary` to track accuracy trends, catch hallucinations, and measure system performance.
 
 ---
-
-## License
-
-MIT
