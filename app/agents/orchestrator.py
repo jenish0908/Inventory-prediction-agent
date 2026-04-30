@@ -4,20 +4,17 @@ import uuid
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
-from app.models.database import Product, SalesHistory, Prediction, AgentEvaluation
-from app.models.schemas import InventoryDecision
+from app.models.database import Prediction, AgentEvaluation
+from app.models.schemas import InventoryDecision, SupplierOrderResult
 from app.agents.demand_forecasting import run_demand_forecasting_agent
 from app.agents.anomaly_detection import run_anomaly_detection_agent
 from app.agents.catalog_validation import run_catalog_validation_agent
 from app.services.cache import cache_get, cache_set
+from app.services.mcp_client import inventory_mcp, supplier_mcp
 
 
 def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
-    # Gemini 1.5 Flash free tier = $0.00 per token
-    # Paid tier rates kept here for reference if you upgrade:
-    # input: $0.000000075/token, output: $0.0000003/token
     return 0.0
 
 
@@ -48,7 +45,6 @@ def _calculate_restock_quantity(
     reorder_point: int,
     lead_time_days: int,
 ) -> int:
-    # Cover lead time + 7-day demand + safety buffer (50% of weekly demand)
     safety_buffer = int(predicted_demand_7d * 0.5)
     lead_time_demand = int((predicted_demand_7d / 7) * lead_time_days)
     needed = (predicted_demand_7d + lead_time_demand + safety_buffer) - current_stock
@@ -65,58 +61,60 @@ async def run_orchestrator(
     if cached:
         return InventoryDecision(**cached)
 
-    # Fetch product
-    result = await db.execute(select(Product).where(Product.id == product_id))
-    product: Optional[Product] = result.scalar_one_or_none()
-    if product is None:
-        raise ValueError(f"Product {product_id} not found")
+    # ── Step 1: Fetch product data + sales history via inventory MCP (parallel) ──
+    product_data, sales_data = await asyncio.gather(
+        inventory_mcp.get_product_info(str(product_id)),
+        inventory_mcp.get_sales_history(str(product_id), days=30),
+    )
 
-    # Fetch last 30 days of sales history
-    sales_result = await db.execute(
-        select(SalesHistory)
-        .where(SalesHistory.product_id == product_id)
-        .order_by(SalesHistory.sale_date.desc())
-        .limit(30)
-    )
-    sales_rows = sales_result.scalars().all()
-    historical_sales = [
-        {"sale_date": str(s.sale_date), "units_sold": s.units_sold}
-        for s in sales_rows
-    ]
-    avg_daily_sales = (
-        sum(s.units_sold for s in sales_rows) / len(sales_rows) if sales_rows else 0.0
-    )
+    if "error" in product_data:
+        raise ValueError(product_data["error"])
+
+    historical_sales = sales_data.get("history", [])
+    avg_daily_sales = sales_data.get("avg_daily_sales", 0.0)
 
     start_time = time.monotonic()
 
-    # Demand and catalog can run fully in parallel; anomaly needs the demand result first
-    (demand_result, demand_in, demand_out), (catalog_result, catalog_in, catalog_out) = (
-        await asyncio.gather(
-            run_demand_forecasting_agent(
-                product_id=str(product_id),
-                product_name=product.name,
-                category=product.category,
-                current_stock=product.current_stock,
-                reorder_point=product.reorder_point,
-                historical_sales=historical_sales,
-            ),
-            run_catalog_validation_agent(
-                name=product.name,
-                category=product.category,
-                supplier_id=str(product.supplier_id),
-                lead_time_days=product.lead_time_days,
-                reorder_point=product.reorder_point,
-                current_stock=product.current_stock,
-            ),
-        )
+    # ── Step 2: LLM agents + supplier lead-time verification (all parallel) ──
+    (
+        (demand_result, demand_in, demand_out),
+        (catalog_result, catalog_in, catalog_out),
+        supplier_lead_data,
+    ) = await asyncio.gather(
+        run_demand_forecasting_agent(
+            product_id=str(product_id),
+            product_name=product_data["name"],
+            category=product_data["category"],
+            current_stock=product_data["current_stock"],
+            reorder_point=product_data["reorder_point"],
+            historical_sales=historical_sales,
+        ),
+        run_catalog_validation_agent(
+            name=product_data["name"],
+            category=product_data["category"],
+            supplier_id=product_data["supplier_id"],
+            lead_time_days=product_data["lead_time_days"],
+            reorder_point=product_data["reorder_point"],
+            current_stock=product_data["current_stock"],
+        ),
+        supplier_mcp.get_lead_time(
+            supplier_id=product_data["supplier_id"],
+            product_category=product_data["category"],
+        ),
     )
 
+    # Use supplier-verified lead time; fall back to DB value if MCP returns unexpected data
+    verified_lead_time = supplier_lead_data.get(
+        "lead_time_days", product_data["lead_time_days"]
+    )
+
+    # ── Step 3: Anomaly detection (needs demand result + verified lead time) ──
     anomaly_result, anomaly_in, anomaly_out = await run_anomaly_detection_agent(
-        product_name=product.name,
-        current_stock=product.current_stock,
+        product_name=product_data["name"],
+        current_stock=product_data["current_stock"],
         predicted_demand=demand_result.predicted_demand_next_7_days,
-        reorder_point=product.reorder_point,
-        lead_time_days=product.lead_time_days,
+        reorder_point=product_data["reorder_point"],
+        lead_time_days=verified_lead_time,
         avg_daily_sales=avg_daily_sales,
     )
 
@@ -127,7 +125,7 @@ async def run_orchestrator(
     cost_usd = _estimate_cost(total_input_tokens, total_output_tokens)
 
     restock_recommended = (
-        product.current_stock <= product.reorder_point
+        product_data["current_stock"] <= product_data["reorder_point"]
         or anomaly_result.anomaly_type == "stockout_risk"
         or anomaly_result.severity == "high"
     )
@@ -135,9 +133,9 @@ async def run_orchestrator(
     restock_quantity = (
         _calculate_restock_quantity(
             demand_result.predicted_demand_next_7_days,
-            product.current_stock,
-            product.reorder_point,
-            product.lead_time_days,
+            product_data["current_stock"],
+            product_data["reorder_point"],
+            verified_lead_time,
         )
         if restock_recommended
         else 0
@@ -146,8 +144,8 @@ async def run_orchestrator(
     priority_level = _determine_priority(
         restock_recommended,
         anomaly_result.severity,
-        product.current_stock,
-        product.reorder_point,
+        product_data["current_stock"],
+        product_data["reorder_point"],
         demand_result.predicted_demand_next_7_days,
     )
 
@@ -155,9 +153,36 @@ async def run_orchestrator(
         f"Demand forecast: {demand_result.predicted_demand_next_7_days} units over next 7 days "
         f"(confidence: {demand_result.confidence_score:.0%}, trend: {demand_result.trend_direction}). "
         f"Anomaly: {anomaly_result.anomaly_type} at {anomaly_result.severity} severity. "
+        f"Supplier-verified lead time: {verified_lead_time} days "
+        f"({supplier_lead_data.get('supplier_name', 'unknown supplier')}). "
         f"Catalog health: {catalog_result.catalog_health_score:.0%}. "
         f"{demand_result.reasoning} {anomaly_result.recommended_action}"
     )
+
+    # ── Step 4: If restocking, create PO + log recommendation via MCP (parallel) ──
+    supplier_order: Optional[SupplierOrderResult] = None
+    if restock_recommended:
+        po_data, _ = await asyncio.gather(
+            supplier_mcp.create_purchase_order(
+                supplier_id=product_data["supplier_id"],
+                product_id=str(product_id),
+                product_name=product_data["name"],
+                quantity=restock_quantity,
+                priority=priority_level,
+            ),
+            inventory_mcp.log_restock_recommendation(
+                product_id=str(product_id),
+                quantity=restock_quantity,
+                priority=priority_level,
+                reason=reasoning,
+            ),
+        )
+        supplier_order = SupplierOrderResult(
+            order_id=po_data["order_id"],
+            supplier_name=po_data["supplier_name"],
+            estimated_delivery_date=po_data["estimated_delivery_date"],
+            status=po_data["status"],
+        )
 
     decision = InventoryDecision(
         product_id=product_id,
@@ -170,9 +195,11 @@ async def run_orchestrator(
         catalog_validation=catalog_result,
         latency_ms=elapsed_ms,
         cost_usd=cost_usd,
+        supplier_order=supplier_order,
+        supplier_lead_time_days=verified_lead_time,
     )
 
-    # Generate ID in Python so the evaluation FK is available before flush
+    # ── Step 5: Persist prediction + evaluation to DB ──
     prediction_id_new = uuid.uuid4()
     prediction = Prediction(
         id=prediction_id_new,
@@ -195,7 +222,6 @@ async def run_orchestrator(
     db.add(evaluation)
     await db.commit()
 
-    # Cache the decision
     await cache_set(cache_key, decision.model_dump(), ttl=300)
 
     return decision

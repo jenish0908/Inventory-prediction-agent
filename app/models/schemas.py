@@ -4,6 +4,15 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
 
+# ── MCP supplier order ────────────────────────────────────────────────────────
+
+class SupplierOrderResult(BaseModel):
+    order_id: str
+    supplier_name: str
+    estimated_delivery_date: str
+    status: str
+
+
 # ── Product ──────────────────────────────────────────────────────────────────
 
 class ProductCreate(BaseModel):
@@ -62,6 +71,8 @@ class InventoryDecision(BaseModel):
     catalog_validation: CatalogValidationResult
     latency_ms: int
     cost_usd: float
+    supplier_order: Optional[SupplierOrderResult] = None
+    supplier_lead_time_days: Optional[int] = None
 
 
 # ── Batch predict ─────────────────────────────────────────────────────────────

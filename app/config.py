@@ -18,5 +18,9 @@ class Settings(BaseSettings):
     # Batch prediction limit
     batch_limit: int = 20
 
+    # MCP server base URLs
+    inventory_mcp_url: str = "http://inventory-mcp:8001"
+    supplier_mcp_url: str = "http://supplier-mcp:8002"
+
 
 settings = Settings()
